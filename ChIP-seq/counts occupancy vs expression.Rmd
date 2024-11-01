@@ -1,0 +1,600 @@
+---
+title: "Occupancy vs Gene Expression - Analysis from count values"
+author: "Alex Lessenger"
+date: "2024-02-06"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Workflow
+1. obtain counts
+  - Use 2 methods
+    - `Rsubread::featurecounts`, which will count number of fragments that overlap with a gene
+    - modified version of Georgi Marinov's script `countsFromBAM.py`, which will count the number of midpoints +/- 25 bp that overlap with a gene "full fragment midpoint"
+  - Remove samples with low signal to noise ratio
+    - determined this from FPKM values, which allow within-sample comparison of genes
+    - samples C1, C3, and L3 have low signal. This is apparent in a histogram of their FPKMs, where there is a lower, sharper peak and a higher, broader peak. In these samples, these two peaks have poor separation
+  
+2. do differential expression analysis with `DESeq2`
+
+3. test if Pol II occupancy in control predicts fold change in occupancy, analogous to how expression in control predicts fold change in expression
+
+4. combine chip with RNA-seq to test if expression in control predicts fold change in occupancy
+
+5. metagene profiles
+
+### Preliminaries
+```{r}
+library(tidyverse)
+library(extrafont)
+loadfonts('pdf', quiet = T)
+```
+
+## 1. obtain count data
+### counts with `featureCounts`
+```{r eval=FALSE}
+library(Rsubread)
+
+gtf = file.path('bowtie_alignment',
+                'caenorhabditis_elegans.PRJNA13758.WBPS18.canonical_geneset.gtf')
+EL_BAMs <- list.files(path = 'bowtie_alignment/BAM_files/EL_BAMs/',
+                      full.names = TRUE)[c(4,2,6,3)]
+counts <- featureCounts(files = EL_BAMs,
+                        annot.ext = gtf,
+                        isGTFAnnotationFile = TRUE,
+                        GTF.featureType = 'gene',
+                        countMultiMappingReads = FALSE,
+                        isPairedEnd = TRUE,
+                        checkFragLength = TRUE,
+                        requireBothEndsMapped = TRUE,
+                        nthreads = 4
+)
+saveRDS(counts, file = 'counts/featurecounts/featurecounts_output.rds')
+```
+
+```{r}
+# Restore the object
+counts<-readRDS(file = 'counts/featurecounts/featurecounts_output.rds')
+
+counts_mat <- counts$counts
+sample_names <- c('C2', 'C4', 'LP1', 'LP4')
+colnames(counts_mat) <- sample_names
+mtDNA_filter = counts$annotation$Chr != 'MtDNA'
+counts_mat <- counts_mat[mtDNA_filter,]
+
+write.table(counts_mat, 'counts/featurecounts/fc_counts_matrix_df.tsv',
+            quote = FALSE)
+```
+
+### counts of fragment midpoints
+Note FFMP = full fragment mid point
+```{r}
+ffmp_raw <- read.csv('counts/midpoint_counts/ffmp_counts_matrix_df.tsv', 
+                      stringsAsFactors = F, sep = '\t') %>%
+  filter(chr != 'MtDNA') %>% 
+  select(gene_ID:attribute, C2_EL, C4_EL, LP1_EL, LP4_EL) %>%
+  #select(gene_ID:attribute, C1_EL, C2_EL, C3_EL, C4_EL, LP1_EL, LP3_EL, LP4_EL) %>%
+  rename_with(~ str_replace(.x, "_EL$", ""))
+
+ffmp_mat <- ffmp_raw %>%
+  column_to_rownames(var = 'gene_ID') %>%
+  select(!gene_name:attribute) %>%
+  as.matrix()
+```
+
+### Load expression data RNA-seq and control occupancy data (from FPKM)
+```{r}
+raw_RNA_int <- read.table('analysis_tables/TPM_l2FC.tsv', 
+                          sep = '\t', stringsAsFactors = F, header = 1) %>%
+  mutate(exp24_in_int = TRUE) %>%
+  distinct()
+raw_chip_fpkm <- read.table('analysis_tables/ChIP_EL_FPKM.tsv',
+                            sep = '\t', stringsAsFactors = F, header = 1) %>%
+  select(WormbaseID = gene_ID, chip_con_fpkm = mean_EL_raw_C)
+```
+
+
+## 2. Differential expression with DESeq2
+```{r DESeq2}
+library(DESeq2)
+coldata <- data.frame(genotype = str_extract(colnames(ffmp_mat), '[[:alpha:]]*'),
+                      row.names = colnames(ffmp_mat))
+
+# check that colData row names match count matrix col names before creating DESeq2 Data Set
+# all(rownames(coldata) == colnames(counts_mat)) & all(rownames(coldata) == colnames(ffmp_mat))
+all(rownames(coldata) == colnames(ffmp_mat))
+
+# create DESeq2 Data Set
+# count_dds <- DESeqDataSetFromMatrix(countData = counts_mat, colData = coldata, design = ~ genotype)
+
+ffmp_dds <- DESeqDataSetFromMatrix(countData = ffmp_mat,colData = coldata, design = ~ genotype)
+
+# relevel dds to ensure that the control treatment is the first level
+#count_dds$genotype <- relevel(count_dds$genotype, ref = 'C')
+ffmp_dds$genotype <- relevel(ffmp_dds$genotype, ref = 'C')
+
+## results
+#count_res <- results(DESeq(count_dds)) 
+ffmp_res <- results(DESeq(ffmp_dds))
+
+ffmp_deseq_df <- ffmp_res %>%
+  as.data.frame() %>%
+  rownames_to_column(var = 'gene_ID') %>%
+  right_join(select(ffmp_raw, gene_ID:gene_biotype)) %>%
+  filter(gene_biotype %in% c('protein_coding', 'rRNA'))  %>%
+  rename(WormbaseID = gene_ID)
+
+write.table(ffmp_deseq_df, 'R_output/chip_deseq_res.tsv', sep = '\t', quote = F, row.names = F)
+```
+
+### Quality control:
+  - Check signal to noise ratio of intestine-expressed vs non-expressed genes
+  - Filter non-stringently based on being expressed in intestine (Kaletsky 2016 dataset) or having a high fpkm or baseMean.
+```{r quality control}
+ffmp_deseq_df %>%
+  left_join(raw_RNA_int, by = c('WormbaseID'), suffix = c('_chip', '_rna')) %>%
+  left_join(raw_chip_fpkm) %>%
+  filter(gene_biotype == 'protein_coding') %>%
+  group_by(exp24_in_int) %>%
+  summarize(mean_base = mean(baseMean_chip),
+            mean_con_fpkm = mean(chip_con_fpkm),
+            mean_l2fc_chip = mean(log2FoldChange)) %>%
+  print()
+
+kaletsky_int <- read.csv('analysis_tables/kaletsky_intestine.csv', stringsAsFactors = F)
+ffmp_deseq_filt <- ffmp_deseq_df %>%
+  left_join(kaletsky_int) %>%
+  left_join(raw_chip_fpkm) %>%
+  filter(baseMean > 10) %>%
+  filter(int_kaletsky == TRUE | baseMean >= 405 | chip_con_fpkm >= 15.4) %>%
+  rename(l2FC_chip = log2FoldChange) %>%
+  distinct()
+write.table(ffmp_deseq_filt, 'R_output/chip_deseq_filtered.tsv', sep = '\t', quote = F, row.names = F)
+```
+
+## 3. Plot occupancy vs fold change in occupancy from ChIP data
+```{r occupancy vs fc in occupancy}
+scatter_with_bins <- function(data, x, y, bin, logx = F, scatter = F, xmin = NA, xmax = NA, color = 'darkgreen') {
+  bin_summary <- data %>%
+    mutate(group = ntile({{bin}}, 20)) %>%
+    group_by(group) %>%
+    summarize(mean_x = mean({{x}}),
+              mean_y = mean({{y}}),
+              ci99_x = 2.576 * sd({{x}}) / sqrt(n()),
+              ci99_y = 2.576 * sd({{y}}) / sqrt(n()))
+
+  p <- ggplot(bin_summary, aes(mean_x, mean_y)) +
+    {if(scatter) geom_point(data = data,
+                            aes({{x}}, {{y}}),
+                            alpha = 0.1)} +
+    geom_errorbar(aes(xmin = mean_x-ci99_x, xmax = mean_x+ci99_x),
+                  width = 0, color = 'grey50', linewidth = 0.6) +
+    geom_errorbar(aes(ymin = mean_y-ci99_y, ymax = mean_y+ci99_y),
+                  width = 0, color = 'grey50', linewidth = 0.6) +
+    geom_point(size = 1.2, color = color) +
+    {if(logx) scale_x_log10(limits = c(xmin, xmax),
+                            breaks = scales::trans_breaks("log10", function(x) 10^x),
+                            labels = scales::trans_format("log10", scales::math_format(10^.x)))} +
+    {if(logx) annotation_logticks(sides = 'b', linewidth = 0.3, color = 'grey50',
+                                  short = unit(0.07, 'cm'), mid = unit(0.14, 'cm'), long = unit(0.21, 'cm'))} +
+    labs(x = enquo(x), y = enquo(y)) +
+    theme_minimal() +
+    theme(text = element_text(family = 'Arial', color = "black", size = 8),
+          axis.text = element_text(family = 'Arial', color = "black", size = 8),
+          axis.text.x = element_text(margin = margin(t = 0, b = 0)),
+          axis.line = element_line(color = 'grey50', linewidth = 0.3),
+          panel.grid.major = element_line(linewidth = 0.2, color = 'grey90'),
+          panel.grid.minor = element_line(linewidth = 0.15, color = 'grey90'))
+  print(dim(data)[1])
+  return(p)
+}
+```
+
+```{r occupancy vs change in occupancy}
+scatter_with_bins(ffmp_deseq_filt, chip_con_fpkm, l2FC_chip, chip_con_fpkm, T, F, 4, 100) +
+  scale_y_continuous(limits = c(-1, 1))
+# ggsave('R_plots/Exp035 occupancy vs l2FC occupancy.pdf', device = cairo_pdf, units = 'in', width = 3.15, height = 2.2)
+
+scatter_with_bins(ffmp_deseq_filt, chip_con_fpkm, l2FC_chip, chip_con_fpkm, T, T, 4, 100) 
+# ggsave('R_plots/Exp035 occupancy vs l2FC occupancy with scatter.pdf', device = cairo_pdf, units = 'in', width = 3.15, height = 2.2)
+# ggsave('R_plots/Exp035 occupancy vs l2FC occupancy with scatter.png', device = 'png', units = 'in', width = 3.15, height = 2.2, dpi = 300)
+```
+
+## 4. Expression (RNA-seq) vs fold change in occupancy (ChIP)
+
+```{r combine with RNA-seq}
+union <- raw_RNA_int %>%
+  select(WormbaseID, GeneID, con_TPM, baseMean, l2FC_TPM) %>%
+  left_join(select(ffmp_deseq_filt, WormbaseID, baseMean, l2FC_chip, lfcSE_chip = lfcSE),
+            by = 'WormbaseID', suffix = c('_rna', '_chip')) %>% 
+  filter(!is.na(baseMean_chip))
+
+write.table(union, 'R_output/chip_rna_union.tsv', sep = '\t', quote = F, row.names = F)
+```
+
+```{r expression vs change in occupancy}
+scatter_with_bins(union, con_TPM, l2FC_chip, con_TPM, T, F, xmax = 10000) +
+  scale_y_continuous(limits = c(-1,1))
+# ggsave('R_plots/Exp035 expression vs l2FC occupancy.pdf', device = cairo_pdf, units = 'in', width = 2.5, height = 2.2)
+
+scatter_with_bins(union, con_TPM, l2FC_chip, con_TPM, T, T)
+# ggsave('R_plots/Exp035 expression vs l2FC occupancy with scatter.pdf', device = cairo_pdf, units = 'in', width = 3.15, height = 2.2)
+# ggsave('R_plots/Exp035 expression vs l2FC occupancy with scatter.png', device = 'png', units = 'in', width = 3.15, height = 2.2, dpi = 300)
+```
+
+
+## 5. TSS: Occupancy and expression vs occupancy fold change using TSS full fragment midpoints
+```{r}
+tss_ffmp_raw <- read.csv('counts/TSS_midpoint_counts/TSS_ffmp_counts_matrix_df.tsv', 
+                      stringsAsFactors = F, sep = '\t') %>%
+  filter(chr != 'MtDNA') %>%
+  # select(gene_ID:attribute, C2_EL, C4_EL, LP1_EL, LP4_EL) %>%
+  rename_with(~ str_replace(.x, "_EL$", ""))
+
+tss_mat <- tss_ffmp_raw %>%
+  column_to_rownames(var = 'gene_ID') %>%
+  select(!gene_name:attribute) %>%
+  as.matrix()
+
+library(DESeq2)
+## create DESeq2 Data Set
+coldata_tss <- data.frame(genotype = str_extract(colnames(tss_mat), '[[:alpha:]]*'),
+                      row.names = colnames(tss_mat))
+all(rownames(coldata_tss) == colnames(tss_mat))
+tss_dds <- DESeqDataSetFromMatrix(countData = tss_mat, colData = coldata_tss, design = ~ genotype)
+tss_dds$genotype <- relevel(tss_dds$genotype, ref = 'C')
+
+## DESeq results
+tss_res <- results(DESeq(tss_dds))
+tss_deseq_df <- tss_res %>%
+  as.data.frame() %>%
+  rownames_to_column(var = 'gene_ID') %>%
+  right_join(select(tss_ffmp_raw, gene_ID:gene_biotype)) %>%
+  filter(gene_biotype %in% c('protein_coding', 'rRNA'))  %>%
+  rename(WormbaseID = gene_ID)
+
+write.table(tss_deseq_df, 'R_output/chip_tss_deseq_res.tsv', sep = '\t', quote = F, row.names = F)
+```
+
+```{r}
+tss_deseq_df %>%
+  inner_join(select(raw_RNA_int, WormbaseID, con_TPM, l2FC_TPM, exp24_in_int)) %>%
+  filter(gene_biotype == 'protein_coding',
+         exp24_in_int == TRUE,
+         !WormbaseID %in% c('WBGene00006977', 'WBGene00016039')) %>%
+ggplot(aes(con_TPM, log2FoldChange)) +
+  geom_point(alpha = 0.05) +
+  geom_smooth() +
+  scale_x_log10()
+  scale_y_log10()
+  scale_y_continuous(limits = c(-3, 2.5))
+```
+
+## 6. TSS V2: Occupancy and expression vs occupancy fold change using asymmetric TSS full fragment midpoints
+
+Analysis of metagene profiles (Section 7, below) shows that the Pol II peak on the TSS is not symmetric around the TSS and goes from -100 bp to +200 bp. Using this window may give better signal-to-noise ratio, particularly for more lowly expresssed genes.
+
+```{r}
+tss2_ffmp_raw <- read.csv('counts/asymmetricTSS_midpoint_counts/TSS_asymmetric_ffmp_counts_matrix_df.tsv', 
+                      stringsAsFactors = F, sep = '\t') %>%
+  filter(chr != 'MtDNA') %>%
+  # select(gene_ID:attribute, C2_EL, C4_EL, LP1_EL, LP4_EL) %>% # stringent filter
+  select(gene_ID:attribute, C1_EL, C2_EL, C4_EL, LP1_EL, LP3_EL, LP4_EL) %>% # exclude C3_EL, which has very low occupancy
+  rename_with(~ str_replace(.x, "_EL$", ""))
+
+tss2_mat <- tss2_ffmp_raw %>%
+  column_to_rownames(var = 'gene_ID') %>%
+  select(!gene_name:attribute) %>%
+  as.matrix()
+
+library(DESeq2)
+## create DESeq2 Data Set
+coldata_tss2 <- data.frame(genotype = str_extract(colnames(tss2_mat), '[[:alpha:]]*'),
+                      row.names = colnames(tss2_mat))
+all(rownames(coldata_tss2) == colnames(tss2_mat))
+tss2_dds <- DESeqDataSetFromMatrix(countData = tss2_mat, colData = coldata_tss2, design = ~ genotype)
+tss2_dds$genotype <- relevel(tss2_dds$genotype, ref = 'C')
+
+## DESeq results
+tss2_res <- results(DESeq(tss2_dds))
+tss2_deseq_df <- tss2_res %>%
+  as.data.frame() %>%
+  rownames_to_column(var = 'gene_ID') %>%
+  right_join(select(tss2_ffmp_raw, gene_ID:gene_biotype)) %>%
+  filter(gene_biotype %in% c('protein_coding', 'rRNA'))  %>%
+  rename(WormbaseID = gene_ID)
+
+## Get baseMean of control samples only
+## create DESeq2 Data Set of control columns only
+tss2_control_mat <- tss2_mat[,1:3]
+coldata_tss2_control <- data.frame(genotype = str_extract(colnames(tss2_control_mat), '[[:alpha:]]*'),
+                      row.names = colnames(tss2_control_mat))
+all(rownames(coldata_tss2_control) == colnames(tss2_control_mat))
+tss2_control_dds <- DESeqDataSetFromMatrix(countData = tss2_control_mat, colData = coldata_tss2_control, design = ~ 1)
+tss2_control_res <- results(DESeq(tss2_control_dds))
+
+## join to l2FC results
+tss2_deseq_df <- tss2_control_res %>%
+  as.data.frame() %>%
+  rownames_to_column(var = 'WormbaseID') %>%
+  select(WormbaseID, control_baseMean = baseMean) %>%
+  right_join(tss2_deseq_df)
+
+write.table(tss2_deseq_df, 'R_output/chip_asymmetric_tss_deseq_res.tsv', sep = '\t', quote = F, row.names = F)
+```
+
+```{r}
+x<- tss2_deseq_df %>%
+  inner_join(select(raw_RNA_int, WormbaseID, con_TPM, l2FC_TPM, exp24_in_int)) %>%
+  filter(gene_biotype == 'protein_coding',
+         exp24_in_int == TRUE,
+         !WormbaseID %in% c('WBGene00006977', 'WBGene00016039'))
+
+lm(con_TPM~baseMean, data = x) %>% summary()
+
+ggplot(x, aes(control_baseMean, con_TPM)) +
+  geom_point(alpha = 0.05) +
+  geom_smooth() +
+  labs(x = 'control ChIP baseMean', y = 'control RNA-seq TPM') +
+  scale_x_log10() +
+  scale_y_log10()
+
+ggplot(x, aes(control_baseMean, log2FoldChange)) +
+  geom_point(alpha = 0.05) +
+  geom_smooth() +
+  scale_x_log10()
+
+ggplot(x, aes(log2FoldChange, l2FC_TPM)) +
+  geom_point(alpha = 0.05) +
+  geom_smooth() 
+
+lm(l2FC_TPM~log2FoldChange, data = x) %>% summary()
+```
+
+
+## 7. Metagene profiles
+```{r}
+library(tidyverse)
+library(GenomicRanges) 
+library(genomation)
+
+sm_as_df <- function(annotation, region, bw_list, sample_names){
+  gr <- GenomicRanges::makeGRangesFromDataFrame(annotation,
+                                                keep.extra.columns = TRUE)
+  
+  if(region=='us') gr <- gr %>% flank(width = 500, start = TRUE) 
+  else if(region=='ds') gr <- gr %>% flank(width = 500, start = FALSE) 
+  
+  meta_profile_df <- genomation::ScoreMatrixList(target = bw_list,
+                                                 windows=gr, 
+                                                 bin.num=500, 
+                                                 type='bigWig', 
+                                                 strand.aware=TRUE) %>%
+    genomation::plotMeta() %>% 
+    as_tibble() %>%
+    t()
+
+  colnames(meta_profile_df) <- sample_names
+
+  # rename columns with respect to TSS
+  if(region == 'us') rownames(meta_profile_df) <- seq(-500,-1)
+  else if (region == 'gene') rownames(meta_profile_df) <- seq(0, 998, by = 2)
+  else if (region == 'ds') rownames(meta_profile_df) <- seq(1000,1499)
+
+  meta_profile_df <- data.frame(meta_profile_df) %>% 
+    rownames_to_column('bp') %>%
+    mutate(bp = as.integer(bp))
+  
+  return(meta_profile_df)
+}
+
+full_profile <- function(annotation, bw_list, sample_names) {
+  df_us <- sm_as_df(annotation, 'us', bw_list, sample_names)
+  df_gene <- sm_as_df(annotation, 'gene', bw_list, sample_names)
+  df_ds <- sm_as_df(annotation, 'ds', bw_list, sample_names)
+  
+  df <- rbind(df_us, df_gene, df_ds) %>%
+    pivot_longer(cols = all_of(sample_names), names_to = 'sample')
+  return(df)
+}
+
+many_profiles_ntiles <- function(annotation, bw_list, sample_names, ntile_list) {
+  # ntile_list: list of integers
+
+  df_out <- data.frame()
+  for(i in ntile_list) {
+    print(paste('processing bin: ', i))
+    df <- filter(annotation, ntile == i) %>%
+      full_profile(bw_list, sample_names) %>%
+      mutate(ntile = i)
+    
+    df_out <- bind_rows(df_out, df)
+  }
+
+  return(df_out)
+}
+
+## inputs: annotation file with bins and list of bigwig files
+bw_files <- dir('genebody_profiles/bigwig_files/EL_bws', pattern=".bw$", full.names = T)
+sample_names <- str_extract(bw_files, '\\w+\\d_\\w+(?=_RPM_profile.bw$)')
+
+binned_annotation <- raw_RNA_int %>%
+  select( WormbaseID, con_TPM, exp24_in_int) %>%
+  left_join(counts$annotation, by = c('WormbaseID' = 'GeneID')) %>%
+  filter(exp24_in_int == TRUE) %>%
+  mutate(ntile = ntile(con_TPM, 50))
+
+## create dataframe of metagene profiles for all bins for all samples
+mgp <- many_profiles_ntiles(binned_annotation, bw_files, sample_names, c(10, 25, 35, 45, 47, 49, 50))
+
+## plot, faceted by sample, colored by expression level
+ggplot(mgp, aes(bp, value, color = as.factor(ntile))) +
+  geom_line() +
+  facet_wrap(~sample, scales= 'free')
+```
+
+### repeat plotting profiles but for fixed distance around TSS
+This should enable visualization of the actual physical size of the RNA Pol II peak around the TSS
+```{r}
+sm_as_df <- function(annotation, region, bw_list, sample_names){
+  gr <- GenomicRanges::makeGRangesFromDataFrame(annotation,
+                                                keep.extra.columns = TRUE)
+  
+  if(region=='us') gr <- gr %>% flank(width = 500, start = TRUE) 
+  else if(region=='head') gr <- gr %>% flank(width = -500, start = TRUE) 
+  
+  meta_profile_df <- genomation::ScoreMatrixList(target = bw_list,
+                                                 windows=gr, 
+                                                 bin.num=500, 
+                                                 type='bigWig', 
+                                                 strand.aware=TRUE) %>%
+    genomation::plotMeta() %>% 
+    as_tibble() %>%
+    t()
+
+  colnames(meta_profile_df) <- sample_names
+
+  # rename columns with respect to TSS
+  if(region == 'us') rownames(meta_profile_df) <- seq(-500,-1)
+  else if (region == 'head') rownames(meta_profile_df) <- seq(0, 499)
+
+  meta_profile_df <- data.frame(meta_profile_df) %>% 
+    rownames_to_column('bp') %>%
+    mutate(bp = as.integer(bp))
+  
+  return(meta_profile_df)
+}
+
+tss_profile <- function(annotation, bw_list, sample_names) {
+  df_us <- sm_as_df(annotation, 'us', bw_list, sample_names)
+  df_head <- sm_as_df(annotation, 'head', bw_list, sample_names)
+  
+  df <- rbind(df_us, df_head) %>%
+    pivot_longer(cols = all_of(sample_names), names_to = 'sample')
+  return(df)
+}
+
+many_profiles_ntiles <- function(annotation, bw_list, sample_names, ntile_list) {
+  # ntile_list: list of integers
+
+  df_out <- data.frame()
+  for(i in ntile_list) {
+    print(paste('processing bin: ', i))
+    df <- filter(annotation, ntile == i) %>%
+      tss_profile(bw_list, sample_names) %>%
+      mutate(ntile = i)
+    
+    df_out <- bind_rows(df_out, df)
+  }
+
+  return(df_out)
+}
+
+## inputs: annotation file with bins and list of bigwig files
+bw_files <- dir('genebody_profiles/bigwig_files/EL_bws', pattern=".bw$", full.names = T)
+sample_names <- str_extract(bw_files, '\\w+\\d_\\w+(?=_RPM_profile.bw$)')
+
+binned_annotation <- raw_RNA_int %>%
+  select( WormbaseID, con_TPM, exp24_in_int) %>%
+  left_join(counts$annotation, by = c('WormbaseID' = 'GeneID')) %>%
+  filter(exp24_in_int == TRUE) %>%
+  mutate(ntile = ntile(con_TPM, 50))
+
+## create dataframe of metagene profiles for all bins for all samples
+mgp <- many_profiles_ntiles(binned_annotation, bw_files, sample_names, c(10, 25, 35, 45, 47, 49, 50))
+
+## plot, faceted by sample, colored by expression level
+ggplot(mgp, aes(bp, value, color = as.factor(ntile))) +
+  geom_line() +
+  facet_wrap(~sample) +
+  scale_x_continuous(breaks = seq(-500, 500, 100))
+```
+
+
+
+
+
+## Old
+```{r old plots}
+scatter_with_bins <- function(data, x, y, bin, logx = F, scatter = F, bin_by = 'ptile', weighted_y = F, weights) {
+  if(bin_by == 'ptile'){
+    bin_summary <- data %>%
+      mutate(group = ntile({{bin}}, 20))
+  } else if(bin_by == 'log_value'){
+    bin_summary <- data %>%
+      mutate(group = cut(log({{bin}}), 10))
+  }
+  
+  if(weighted_y){
+    bin_summary <- bin_summary %>%
+      mutate(inv_weights = 1 / abs({{weights}}/{{y}})) %>%
+      group_by(group) %>%
+      summarize(mean_x = mean({{x}}),
+                mean_y = weighted.mean({{y}}, inv_weights),
+                ci99_x = 2.576 * sd({{x}}) / sqrt(n()),
+                ci99_y = 2.576 * sd({{y}}) / sqrt(n()))
+  } else {
+    bin_summary <- bin_summary %>%
+      group_by(group) %>%
+      summarize(mean_x = mean({{x}}),
+                mean_y = mean({{y}}),
+                ci99_x = 2.576 * sd({{x}}) / sqrt(n()),
+                ci99_y = 2.576 * sd({{y}}) / sqrt(n()))
+  }
+  
+  print(bin_summary)
+
+  p <- ggplot(bin_summary, aes(mean_x, mean_y)) +
+    {if(scatter) geom_point(data = data,
+                            aes({{x}}, {{y}}),
+                            alpha = 0.1)} +
+    geom_errorbar(aes(xmin = mean_x-ci99_x, xmax = mean_x+ci99_x),
+                  width = 0, color = 'grey50') +
+    geom_errorbar(aes(ymin = mean_y-ci99_y, ymax = mean_y+ci99_y),
+                  width = 0, color = 'grey50') +
+    geom_point(size = 2, color = 'darkorchid') +
+    # {if(logx) scale_x_log10()} +
+    {if(logx) scale_x_log10(breaks = scales::trans_breaks("log10", function(x) 10^x),
+                            labels = scales::trans_format("log10", scales::math_format(10^.x)))} +
+    {if(logx) annotation_logticks(sides = 'b', color = 'grey50')} +
+    labs(x = enquo(x), y = enquo(y)) +
+    theme_minimal() +
+    theme(text = element_text(size = 14, color = 'black'),
+          axis.text.x = element_text(size = 16),
+          axis.line = element_line(color = 'grey50'),
+          panel.grid.major = element_line(linewidth = 0.6, color = 'grey90'))
+  
+  return(p)
+}
+
+kaletsky_int <- read.table('analysis_tables/gene_lists.csv', header = T, sep = ',')
+
+x <- filter(union, chip_con_fpkm > 8.04, baseMean > 379)
+x <- filter(union, con_TPM > 0, baseMean > 10) %>%
+  inner_join(kaletsky_int, by = c('WormbaseID' = 'WormBase.Gene.ID'))
+
+scatter_with_bins(x, chip_con_fpkm, l2FC_ffmp, chip_con_fpkm, T, T, weighted_y = T, weights = lfcSE_ffmp)
+
+scatter_with_bins(x, con_TPM, l2FC_ffmp, con_TPM, T, T, weighted_y = T, weights = lfcSE_ffmp)
+
+scatter_with_bins(x, con_TPM, l2FC_TPM, con_TPM, T, T)
+scatter_with_bins(x, chip_con_fpkm, l2FC_ffmp, chip_con_fpkm, T, T)
+scatter_with_bins(x, con_TPM, l2FC_ffmp, con_TPM, T, T)
+```
+
+```{r r squared}
+df = filter(union, con_TPM > 6)
+summary(lm(con_TPM~chip_con_fpkm, data = df))$r.squared 
+summary(lm(con_TPM~l2FC_TPM, data = df))$r.squared
+summary(lm(con_TPM~l2FC_ffmp, data = df))$r.squared
+summary(lm(chip_con_fpkm~l2FC_ffmp, data = df))$r.squared
+summary(lm(l2FC_ffmp~l2FC_TPM, data = df))$r.squared
+```
+
+
+
+
+

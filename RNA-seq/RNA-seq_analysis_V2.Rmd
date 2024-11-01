@@ -1,0 +1,899 @@
+---
+title: "RNA-seq Analysis V2"
+author: "Alex Lessenger"
+date: "2024-01-31"
+output: html_document
+editor_options: 
+  markdown: 
+    wrap: 72
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r preliminaries}
+library(tidyverse)
+library(extrafont)
+loadfonts('pdf', quiet = T)
+
+atltheme = function() {
+  theme(legend.position = 'none',
+        panel.background = element_blank(),
+        strip.background = element_blank(), 
+        legend.key = element_blank(),
+        axis.line = element_line(color = "black", linewidth = 0.3),
+        text = element_text(family = 'Arial', color = "black", size = 8),
+        axis.text = element_text(family = 'Arial', color = "black", size = 8))
+}
+```
+
+## Pipeline
+
+1.  Count reads mapping to each gene with `featurecounts()` from
+    Rsubread package
+
+-   Do not count multi-mappers since they may map to both Cel and Ppa
+    genomes
+
+2.  Calculate sample normalization factor `NF` to convert TPM to TPM per
+    genome
+
+-   Define list of Cel vs Ppa genes using data from wormmine
+-   Count total reads for each species
+-   Calculate TPM
+-   Calculate normalization factor `NF` for each metric (count and TPM)
+    -   `NF` = (Total reads Cel/Total reads Ppa) / (Cel DNA/Ppa DNA qPCR
+        metric)
+    -   `NF_TPM` = (sum(TPM Cel)/sum(TPM Ppa)) / (Cel DNA/Ppa DNA qPCR
+        metric)
+
+3.  Calculate fold change between low ploidy and control using adjusted
+    TPM
+
+-   `TPMadj = TPM/NF_TPM`
+-   `FC = geometric_mean(LP) / geometric_mean(C)`
+    -   Do not use pseudocounts in geometric mean: any genes with TPM =
+        0 in any sample have undefined geometric_mean
+    -   pseudocounts should not be used for normalized data (e.g. TPM)
+        since they bias lowly vs highly expressed genes, which is
+        exactly the effect we hypothesize!
+
+4.  Filter data set to remove low confidnece calls
+
+-   `TPM > 1 | int_kaletsky = T` removes genes that are not expressed in the intestine
+    -   Note, this measure of "expressed" is arbitrary; it would be
+        better to map reads to the genome and determine background level
+-   from DESeq2, `baseMean > 10` removes genes with few counts
+    -   use `estimateSizeFactors` using Ppa genes for `controlGenes`
+    -   use multifactor design
+        -   condition of interest (genotype) at end
+            `design = ~ replicate_group + genotype` to control for
+            replicate group
+        -   replicates AB to one group and C to another to account for
+            using different spike-in amounts (AB got one spike in, C got
+            another) addition to transcriptome and determine the level
+            of background coverage in intergenic regions, but this
+            metric is likely good enough.
+-   exclude *zif-1* and *his-24*, which are artificially expressed in the low ploidy
+    sample
+
+5.  Analysis: expression vs change in expression
+  a. plot distribution of TPM in control and low ploidy, and the distribution of the fold change
+  b. plot change in expression vs control expression
+  c. check if this effect is eliminated by removing
+    i. stress response genes (which would normally be lowly expressed, but may be increased in low ploidy due to stress)
+    ii. cell cycle genes (since the intestine has an altered cell cycle state)
+  d. check if Ppa genes also have this effect (which would indicate a data processing artifact)
+  e. consider hypothesis test based on bootstrapping correlation with permuted values
+6. GO term analysis
+  a. perseus 1D enrichment -> see experiment 043
+  b. callouts of interesting annotations
+    - consider plotting DESeq l2FC, TPM l2FC, and residuals vs glm from 5.
+
+## 1. Count reads with `featureCoutns()`
+
+```{r featureCounts, eval=FALSE}
+library(Rsubread)
+
+combined_gtf = file.path('STAR aligner', 'combined.WS284.Cel.Ppa.canonical_geneset.gtf')
+
+ControlA_bam = file.path('STAR aligner', 'OutputDir', 'ControlA.bam')
+ControlB_bam = file.path('STAR aligner', 'OutputControlB', 'Aligned.out.bam')
+ControlC_bam = file.path('STAR aligner', 'OutputControlC', 'Aligned.out.bam')
+LowPloidyA_bam = file.path('STAR aligner', 'OutputDir3', 'Aligned.out.bam')
+LowPloidyB_bam = file.path('STAR aligner', 'OutputLowPloidyB', 'Aligned.out.bam')
+LowPloidyC_bam = file.path('STAR aligner', 'OutputLowPloidyC', 'Aligned.out.bam')
+
+file_list <- c(ControlA_bam, ControlB_bam, ControlC_bam, LowPloidyA_bam, LowPloidyB_bam, LowPloidyC_bam)
+
+counts <- featureCounts(files = file_list,
+                        annot.ext = combined_gtf,
+                        isGTFAnnotationFile = TRUE,
+                        countMultiMappingReads = FALSE,
+                        isPairedEnd = TRUE,
+                        nthreads = 4)
+## defaults: 
+## countMultiMappingReads = TRUE
+## fraction = FALSE
+## byReadGroup = FALSE
+
+counts_mat <- counts$counts
+sample_names <- c('ControlA', 'ControlB', 'ControlC', 'LowPloidyA', 'LowPloidyB', 'LowPloidyC')
+colnames(counts_mat) <- sample_names
+write.table(counts_mat, 'R_output/counts_matrix_nomultimappers.tsv',
+            quote = FALSE)
+
+annot_df <- counts$annotation
+write.table(annot_df, 'R analysis/counts_annotation_nomultimappers.tsv',
+            quote = FALSE)
+```
+
+## 2. Calculate sample normalization factor
+
+### Get list of genes for each species
+
+1.  Download list of all Cel and Ppa genes from wormmine Query builder
+    \> Gene
+
+-   Show: Gene \> Wormbase Gene ID
+-   Constrain: Organism \> Name == Caenorhabditis elegans (or
+    Pristionchus pacificus) Concatenate the two lists to make
+    "CelPpaGeneList.tsv"
+
+2.  upload the list of genes to WormMine
+    <http://intermine.wormbase.org/tools/wormmine/bag.do> -Select type:
+    Gene -for organism: Any
+
+Save list.
+
+3.  Make table of gene information
+
+Analyze list and add columns: - Gene \> Gene Name - Gene \> Sequence
+Name - Gene \> Organism
+
+Download table and save it to 'R analysis/CelPpaGeneTable2.tsv'
+
+### Use species data to count reads mapping to Cel vs Ppa
+
+This will generate the numerator of `NF`: total Cel reads/total Ppa
+reads
+
+#### 1. Import data
+
+-   counts matrix from `featureCounts()`
+-   list of Cel and Ppa genes
+-   lengths of all genes and insert sizes of all samples to calculate
+    effective gene lengths
+-   blacklist of genes to exclude from analysis (rRNA and mtDNA-encoded
+    genes)
+-   subset counts matrix and lengths to exclude blacklist
+
+```{r}
+counts_mat <- read.table('analysis_tables/counts_matrix_nomultimappers.tsv', 
+                         header = TRUE, row.names = 1)
+
+genes_cols <- c('WormbaseID', 'GeneID', 'SequenceID', 'Species')
+genes_df <- read.table('analysis_tables/CelPpaGeneTable.tsv',
+                         sep = '\t', 
+                         col.names = genes_cols)
+
+annot_df <- read.table('analysis_tables/counts_annotation_nomultimappers.tsv', 
+                       header = TRUE)
+
+mean_insert_sizes <- read.table('analysis_tables/combined_metrics.tsv', header = TRUE) %>%
+  pull(MEAN_INSERT_SIZE)
+
+## blacklist
+rrna_ids <- filter(genes_df, str_detect(GeneID, 'rrn-')) %>% pull(WormbaseID) %>% as.character()
+mtdna_ids <- filter(annot_df, Chr == 'MtDNA'|Chr == 'PPA_pbcontig695') %>% pull(GeneID) %>% as.character()
+blacklist = c(rrna_ids, mtdna_ids)
+
+## subset counts matrix and lengths vector by excluding genes in blacklist
+counts_wl_mat <- subset(counts_mat, !rownames(counts_mat) %in% blacklist)
+lengths_wl <- annot_df %>% filter(!GeneID %in% blacklist) %>% pull(Length,name = GeneID)
+```
+
+#### 2. Calculate FPKM and TPM
+
+```{r calculate TPM}
+fpkmToTpm_matrix <- function(mat) {
+  fpkmToTpm_vector <- function(x) exp(log(x) - log(sum(x)) + log(1e6))
+  apply(mat, 2, fpkmToTpm_vector)
+}
+
+FPKM_mat <- countToFPKM::fpkm(counts = counts_wl_mat,
+                              featureLength = lengths_wl, 
+                              meanFragmentLength = mean_insert_sizes)
+
+TPM_mat <- fpkmToTpm_matrix(FPKM_mat)
+```
+
+#### 3. Calculate RNA normalization factor for each metric: counts and TPM
+
+```{r rna normalization}
+matrix_ratio_from_lists <- function(mat, list_numerator, list_denominator) {
+  # create 2 sub-matricies from a matrix, where each matrix has only the rownames in a list
+  # one list for 'numerator', one list for 'denominator'
+  bool1 <- row.names(mat) %in% list_numerator
+  bool2 <- row.names(mat) %in% list_denominator
+  ratios <- colSums(mat[bool1,]) / colSums(mat[bool2,])
+  return(ratios)
+}
+
+Cel_gene_list <- genes_df %>% filter(Species == 'Caenorhabditis elegans') %>% pull(WormbaseID)
+Ppa_gene_list <- genes_df %>% filter(Species == 'Pristionchus pacificus') %>% pull(WormbaseID)
+
+count_ratios <- matrix_ratio_from_lists(counts_wl_mat, Cel_gene_list, Ppa_gene_list)
+TPM_ratios <- matrix_ratio_from_lists(TPM_mat, Cel_gene_list, Ppa_gene_list)
+RNA_ratios_df <- data.frame(count_ratios, TPM_ratios) %>%
+  rownames_to_column('sample')
+  # FPKM ratios are mathematically identical to TPM ratios
+```
+
+### Import DNA normalization factors
+
+'qPCR measurements/rRNA and DNA measurements.Rmd' estimated the fold
+change between C. elegans DNA relative to P. pacificus DNA. The results
+are saved as 'R analysis/DNA input ratios.csv'.
+
+These values represent the denomenator of `NF`, and controls for the
+amount of C. elegans tissue loaded in the sample (since this could not
+be measured at the time of sample preparation).
+
+```{r dna normalization}
+DNA_ratios_df <- read.csv('analysis_tables/DNA input ratios.csv', stringsAsFactors = F) %>%
+  mutate(genotype = str_replace(treatment, 'lowploidy', 'LowPloidy'),
+         sample = paste(genotype, replicate, sep = '')) %>%
+  select(-treatment, -template_species)
+```
+
+### Calculate `NF` = RNA ratio / DNA ratio
+
+Note! these values scale samples by the amount of DNA, not the cell
+volume/cell mass.
+
+Theoretically, counts ratio should provide insight to the concentration
+of mRNA by mass (i.e. mass of mRNA/genome), whereas TPM ratio should
+provide insight to the molar concentration (i.e. \# mRNAs/genome)
+
+```{r sample normalziation}
+NF_df <- left_join(RNA_ratios_df, DNA_ratios_df) %>%
+  mutate(counts_per_DNA = count_ratios/Cel_DNA_ratio,
+         TPM_per_DNA = TPM_ratios/Cel_DNA_ratio)
+
+NF_df %>%
+  group_by(genotype) %>%
+  summarize(mean_counts_per_DNA = mean(counts_per_DNA),
+            CV_counts = sd(counts_per_DNA)/mean_counts_per_DNA,
+            mean_TPM_per_DNA = mean(TPM_per_DNA),
+            CV_TPM = sd(TPM_per_DNA)/mean_TPM_per_DNA) %>%
+  print()
+```
+
+## 3. Normalize TPM to NF and compute log2 fold change
+
+Adjust TPMs by `NF_TPM` Take geometric mean of samples within each
+genotype for each gene Calculate log2 fold change of low ploidy/control
+
+```{r adjust TPM}
+Cel_bool = row.names(TPM_mat) %in% Cel_gene_list
+TPM_mat_adj <- TPM_mat[Cel_bool,] %*% diag(NF_df$TPM_per_DNA)
+colnames(TPM_mat_adj) <- colnames(TPM_mat)
+
+gm_mean_rowwise = function(mat) exp( rowSums(log(mat)) / ncol(mat) )
+con_TPM <- gm_mean_rowwise(TPM_mat_adj[,1:3])
+lp_TPM <- gm_mean_rowwise(TPM_mat_adj[,4:6])
+
+TPM_df <- data.frame(con_TPM, lp_TPM) %>%
+  rownames_to_column('WormbaseID') %>%
+  mutate(l2FC_TPM = log2(lp_TPM/con_TPM))
+```
+
+## 4. Filter data set and export
+  - Remove genes with few counts: `DESeq2: baseMean < 6` 
+  - Remove genes without intestine expression: `TPMadj < 1` 
+  - Remove *zif-1* and *his-24*: `WormbaseID != 'WBGene00006977' & WormbaseID != 'WBGene00001898'`
+
+### Use DESeq2 to calculate baseMean
+
+```{r DESeq2}
+library(DESeq2)
+
+coldata <- data.frame(genotype = gsub('.{1}$', '', colnames(counts_wl_mat)),
+                      replicate_group = c('AB', 'AB', 'C', 'AB', 'AB', 'C'),
+                      row.names = colnames(counts_wl_mat))
+# check that colData row names match count matrix col names before creating DESeq2 Data Set
+all(rownames(coldata) == colnames(counts_wl_mat))
+
+# create DESeq2 Data Set
+count_dds <- DESeqDataSetFromMatrix(countData = counts_wl_mat, colData = coldata, design = ~ replicate_group + genotype)
+
+# relevel dds to ensure that the control treatment is the first level
+count_dds$genotype <- relevel(count_dds$genotype, ref = 'Control')
+
+# estimate size factors with controlGenes = Ppa genes
+Ppa_counts_bool <- row.names(counts_wl_mat) %in% Ppa_gene_list
+count_dds <- estimateSizeFactors(count_dds, controlGenes = Ppa_counts_bool)
+
+## results
+deseq_res <- data.frame(results(DESeq(count_dds))) %>%
+  rownames_to_column('WormbaseID')
+```
+
+### Filter and join to human-readable gene names
+Filtering strategy:
+  - strict:
+    - remove genes where l2FC couldn't be calculated due to 0 counts in any sample
+    - remove *zif-1*
+    - l2FC is low confidence due to low counts: `baseMean > 10`
+  - loose:
+    - is expressed in intestine: found in Kaletsky 2018 list of genes from sorted int cells OR is has high TPM in my dataset
+  
+```{r filter}
+kaletsky <- read.table('analysis_tables/kaletsky_intestine.csv', header = T, sep = ',')
+
+TPM_filt <- TPM_df %>%
+  left_join(select(deseq_res, WormbaseID, baseMean, l2FC_deseq = log2FoldChange)) %>%
+  left_join(genes_df) %>%
+  left_join(kaletsky) %>%
+  mutate(int_kaletsky = case_when(int_kaletsky~T, is.na(int_kaletsky)~F)) %>%
+  filter(is.finite(l2FC_TPM),
+         WormbaseID != 'WBGene00006977' & WormbaseID != 'WBGene00001898',
+         baseMean > 10,
+         con_TPM > 2 | int_kaletsky == T) %>%
+    select(-Species) %>%
+  distinct()
+```
+
+```{r export TPM, eval=F}
+write.table(TPM_filt, 'R_output/TPM_l2FC.tsv', sep = '\t', quote = F, row.names = F)
+```
+
+#### Look at concordance between TPM and deseq log2FCs
+There are 8 severe outliers, but all these genes are, curiously, enriched in the spermatheca. However, all but one of the top 10 were found in Kaletsky's data, so likely not an error.
+```{r deseq concordance}
+ggplot(TPM_filt, aes(l2FC_TPM, l2FC_deseq)) +
+  geom_point(alpha = 0.1) 
+
+TPM_filt %>%
+  mutate(residuals = lm(l2FC_deseq~l2FC_TPM, data = .)$residuals) %>%
+  arrange(residuals) %>%
+  head(10)
+```
+
+## 5. Analysis: expression level vs change in expression
+
+### Comparing distributions with histograms
+
+```{r hypothesis testing}
+t.test(log(TPM_filt$con_TPM), log(TPM_filt$lp_TPM))
+```
+Note, any combination of one sample (mu=0)/paired/unpaired and wilcox/t test gives p < 2.2e-16
+
+```{r TxPG histogram}
+p <- TPM_filt %>%
+  pivot_longer(cols = con_TPM:lp_TPM, names_to = 'genotype', values_to = 'TxPG') %>%
+  ggplot(aes(TxPG, fill = genotype)) +
+  scale_x_log10(breaks = scales::trans_breaks("log10", function(x) 10^x),
+                labels = scales::trans_format("log10", scales::math_format(10^.x))) +
+  scale_y_continuous(limits = c(0,550), breaks = seq(0,500,100)) +
+  # scale_y_continuous(limits = c(0,500), breaks = seq(0,500,100)) +
+  geom_histogram(alpha = 0.5, bins = 60, position = 'identity')
+binwidth = layer_data(p) %>% mutate(w=xmax-xmin) %>% pull(w) %>% median
+p1 <- p +
+  stat_bin(aes(color = genotype), geom = 'step',
+           binwidth = binwidth, position=position_nudge(x=-0.5*binwidth)) +
+  scale_fill_manual(values = c('#00328A', '#FF4F57')) +
+  scale_color_manual(values = c('#00328A', '#FF4F57')) +
+  annotation_logticks(sides = 'b', linewidth = 0.2, 
+                      short = unit(0.05, 'cm'), mid = unit(0.1, 'cm'), long = unit(0.15, 'cm')) +
+  atltheme() +
+  theme(axis.ticks.x = element_blank(),
+        axis.text.x = element_text(margin = margin(t = 0, b = 0)))
+# ggsave('R_plots/Exp024 TxPG by genotype dsn.pdf', p1, device = cairo_pdf, units = 'in', width = 2.15, height = 1.9)
+# ggsave('R_plots/Exp024 TxPG by genotype dsn.png', p1, device = 'png', units = 'in', width = 2.15, height = 1.9, dpi = 300)
+```
+
+
+```{r l2FC histogram}
+DNA_conc_FC = 2.284069886 # log2(con/lp DNA/cyt ratio)
+
+p <- ggplot(data = TPM_filt, aes(x = l2FC_TPM)) +
+  geom_histogram(fill = 'grey85', color = 'grey85', bins = 80) 
+binwidth = layer_data(p) %>% mutate(w=xmax-xmin) %>% pull(w) %>% median
+p1 <- p +
+  stat_bin(geom = 'step', binwidth = binwidth, position=position_nudge(x=-0.5*binwidth)) +
+  geom_vline(xintercept = mean(TPM_filt$l2FC_TPM),
+             color = 'darkorchid3', linewidth = 0.5) +
+  geom_vline(xintercept = DNA_conc_FC,
+           color = 'grey20', linewidth = 0.5, linetype = '22') +
+  scale_x_continuous(breaks = seq(-10,10,2)) +
+  labs(x = 'l2FC TxPG (lp/con)') +
+  atltheme()
+# ggsave('R_plots/Exp024 l2FC_TxPG_dsn.pdf', p1, device = cairo_pdf, units = 'in', width = 2.26, height = 1.7)
+# ggsave('R_plots/Exp024 l2FC_TxPG_dsn.png', p1, device = 'png', units = 'in', width = 2.26, height = 1.7, dpi = 300)
+```
+
+```{r l2FC histogram without summary statistic lines}
+# run cell above before running this one
+p2 <- p +
+  stat_bin(geom = 'step', binwidth = binwidth, position=position_nudge(x=-0.5*binwidth)) +
+  # scale_x_continuous(breaks = seq(-10,10,2)) +
+  scale_x_continuous(breaks = scales::trans_breaks("log10", function(x) 2^x)) +
+  labs(x = 'l2FC TxPG (lp/con)') +
+  atltheme()
+
+p2
+# ggsave('R_plots/Exp024 l2FC_TxPG_dsn_no_lines.pdf', p2, device = cairo_pdf, units = 'in', width = 2.26, height = 1.7)
+```
+
+### Plotting function for expression vs fold change
+```{r plotting function}
+scatter_with_bins <- function(data, x, y, bin, logx = F, scatter = F, xmax = NA) {
+  bin_summary <- data %>%
+    mutate(group = ntile({{bin}}, 20)) %>%
+    group_by(group) %>%
+    summarize(mean_x = mean({{x}}),
+              mean_y = mean({{y}}),
+              ci99_x = 2.576 * sd({{x}}) / sqrt(n()),
+              ci99_y = 2.576 * sd({{y}}) / sqrt(n()))
+
+  p <- ggplot(bin_summary, aes(mean_x, mean_y)) +
+    {if(scatter) geom_point(data = data,
+                            aes({{x}}, {{y}}),
+                            alpha = 0.1)} +
+    geom_errorbar(aes(xmin = mean_x-ci99_x, xmax = mean_x+ci99_x),
+                  width = 0, color = 'grey50', linewidth = 0.6) +
+    geom_errorbar(aes(ymin = mean_y-ci99_y, ymax = mean_y+ci99_y),
+                  width = 0, color = 'grey50', linewidth = 0.6) +
+    geom_point(size = 1.2, color = 'darkorchid') +
+    {if(logx) scale_x_log10(limits = c(NA, xmax),
+                            breaks = scales::trans_breaks("log10", function(x) 10^x),
+                            labels = scales::trans_format("log10", scales::math_format(10^.x)))} +
+    {if(logx) annotation_logticks(sides = 'b', linewidth = 0.3, color = 'grey50',
+                                  short = unit(0.07, 'cm'), mid = unit(0.14, 'cm'), long = unit(0.21, 'cm'))} +
+    labs(x = enquo(x), y = enquo(y)) +
+    theme_minimal() +
+    theme(text = element_text(family = 'Arial', color = "black", size = 8),
+          axis.text = element_text(family = 'Arial', color = "black", size = 8),
+          axis.text.x = element_text(margin = margin(t = 0, b = 0)),
+          axis.line = element_line(color = 'grey50', linewidth = 0.3),
+          panel.grid.major = element_line(linewidth = 0.2, color = 'grey90'),
+          panel.grid.minor = element_line(linewidth = 0.15, color = 'grey90'))
+  print(dim(data)[1])
+  return(p)
+}
+```
+
+### Plots of main effect
+```{r}
+scatter_with_bins(TPM_filt, con_TPM, l2FC_TPM, con_TPM, T, F, 10000) +
+  scale_y_continuous(limits = c(0,2.5), breaks = seq(0,2.5,0.5))
+# ggsave('R_plots/Exp024 expression vs l2FC expression.pdf', device = cairo_pdf, units = 'in', width = 3.15, height = 2.2)
+```
+
+```{r}
+scatter_with_bins(TPM_filt, con_TPM, l2FC_TPM, con_TPM, T, T) +
+  labs(x = 'expression (TxPG) in control', y = 'l2FC_TPM')
+# ggsave('R_plots/Exp024 expression vs l2FC expression with scatter.pdf', device = cairo_pdf, units = 'in', width = 3.15, height = 2.2)
+# ggsave('R_plots/Exp024 expression vs l2FC expression with scatter.png', device = 'png', units = 'in', width = 3.15, height = 2.2, dpi = 300)
+```
+
+### Control: does removing stress response or cell cycle genes effect the trend?
+```{r stress response}
+go_terms <- read.csv('analysis_tables/go_terms.csv', stringsAsFactors = F)
+
+stress <- go_terms %>% filter(GO_Term == 'response to stress') %>% pull(WormbaseID)
+cell_cycle <- go_terms %>% filter(GO_Term == 'cell cycle') %>% pull(WormbaseID)
+```
+
+```{r cell cycle}
+filt_and_summ <- function(data, x, y, bin, exclude_col, exclude_list) {
+  bin_summary <- data %>%
+    filter(!{{exclude_col}} %in% exclude_list) %>%
+    mutate(group = ntile({{bin}}, 20)) %>%
+    group_by(group) %>%
+    summarize(mean_x = mean({{x}}),
+              mean_y = mean({{y}}),
+              ci99_x = 2.576 * sd({{x}}) / sqrt(n()),
+              ci99_y = 2.576 * sd({{y}}) / sqrt(n()))
+  return(bin_summary)
+}
+
+df <- bind_rows(list(
+  'none' = filt_and_summ(TPM_filt, con_TPM, l2FC_TPM, con_TPM, WormbaseID, c()),
+  'stress_response' = filt_and_summ(TPM_filt, con_TPM, l2FC_TPM, con_TPM, WormbaseID, stress),
+  'cell_cycle' = filt_and_summ(TPM_filt, con_TPM, l2FC_TPM, con_TPM, WormbaseID, cell_cycle),
+  'ribosome' = filt_and_summ(TPM_filt, con_TPM, l2FC_TPM, con_TPM, WormbaseID, ribosome)
+  ), 
+  .id = 'excluded_genes')
+
+ggplot(df, aes(color = excluded_genes)) +
+  geom_errorbar(aes(x = mean_x, ymin = mean_y-ci99_y, ymax = mean_y+ci99_y), alpha = 0.8) +
+  geom_errorbar(aes(y = mean_y, xmin = mean_x-ci99_x, xmax = mean_x+ci99_x), alpha = 0.8) +
+  geom_point(aes(mean_x, mean_y), size = 1.5, alpha = 0.8) +
+  scale_x_log10(limits = c(NA, 10000),
+                breaks = scales::trans_breaks("log10", function(x) 10^x),
+                labels = scales::trans_format("log10", scales::math_format(10^.x))) +
+  annotation_logticks(sides = 'b', linewidth = 0.3, color = 'grey50',
+                      short = unit(0.07, 'cm'), mid = unit(0.14, 'cm'), long = unit(0.21, 'cm')) +
+  scale_y_continuous(limits = c(0,2.5), breaks = seq(0,2.5,0.5)) +
+  scale_color_brewer(palette = "Dark2") +
+  labs(x = 'expression (TxPG) in control', y = 'l2FC_TPM') +
+  theme_minimal() +
+    theme(text = element_text(family = 'Arial', color = "black", size = 8),
+          axis.text = element_text(family = 'Arial', color = "black", size = 8),
+          axis.text.x = element_text(margin = margin(t = 0, b = 0)),
+          axis.line = element_line(color = 'grey50', linewidth = 0.3),
+          panel.grid.major = element_line(linewidth = 0.2, color = 'grey90'),
+          panel.grid.minor = element_line(linewidth = 0.15, color = 'grey90'))
+# ggsave('R_plots/Exp024 expression vs l2FC expression with exclusions.pdf', device = cairo_pdf, units = 'in', width = 4.4, height = 2.2)
+```
+
+
+### Control: is Ppa FC vs expression flat?
+
+## 6. GO enrichment analysis with Perseus
+Goal is to ask which GO terms have their member genes more/less enriched in low ploidy relative to control. Unlike traditional GO analysis, this does not involve an arbitrary cutoff to analyze DE genes. Instead, it performs a test on each GO term
+
+This analysis is done in Exp043
+
+## 7. Callouts of l2FC of genes with interesting GO terms
+```{r}
+inner_join(TPM_filt, go_terms) %>% 
+  filter(Category %in% c('cytoplasm', 'ribosome', 'transcription')) %>%
+  ggplot(aes(Category, l2FC_TPM, color = Category)) +
+  geom_boxplot()
+  ggbeeswarm::geom_quasirandom()
+  scale_y_continuous(limits = c(-3, 5))
+```
+
+```{r}
+# get residuals
+x <- TPM_filt$con_TPM
+xl <- log(x)
+y <- TPM_filt$l2FC_TPM
+
+summ_df <- filt_and_summ(TPM_filt, con_TPM, l2FC_TPM, con_TPM, WormbaseID, c())
+x1 <- summ_df$mean_x
+x2 <- log(summ_df$mean_x)
+y1 <- summ_df$mean_y
+
+
+fit1 <- lm(y1~x2)
+fit2 <- lm(y1~poly(x2, 2))
+fit3 <- lm(y1~poly(x2, 3))
+
+plot(x2, y1)
+abline(fit1, col = 'red')
+lines(smooth.spline(x2, predict(fit2)), col = 'blue')
+lines(smooth.spline(x2, predict(fit3)), col = 'green', lty=3)
+
+
+fita1 <- lm(y~xl)
+fita2 <- lm(y~poly(xl,2))
+fita3 <- lm(y~poly(xl,3))
+plot(xl, y)
+abline(fita1, col = 'red', lwd = 2)
+lines(smooth.spline(xl, predict(fita2)), col = 'blue', lwd = 2)
+lines(smooth.spline(xl, predict(fita3)), col = 'green', lwd = 2, lty=3)
+
+summary(fita3)
+## partial correlations show how much each term of polynomial contributes to the model
+round(jtools::summ(fita3, part.corr = T)$coef, 3)
+
+TPM_residuals <- TPM_filt %>%
+  mutate(log_con_TPM = log(con_TPM),
+         residual_l2FC_TPM = fita3$residuals) %>%
+  inner_join(go_terms) %>% 
+  filter(Category %in% c('cytoplasm', 'ribosome', 'transcription'))
+
+### plot boxplots
+go_palette <- RColorBrewer::brewer.pal(name="Dark2",n=3)[c(3,1,2)]
+TPM_residuals %>%
+  group_by(Category) %>%
+  mutate(alpha = case_when(n() < 200 ~ 1,
+                           TRUE ~ 1),
+         cat_factor = factor(Category, levels = c('cytoplasm', 'transcription', 'ribosome'))) %>%
+  ggplot(aes(cat_factor, residual_l2FC_TPM)) +
+  geom_hline(aes(yintercept = 0), color = 'grey40', size = 0.5) +
+  geom_boxplot(aes(fill = cat_factor), 
+               outlier.shape = 21, width = 0.7, outlier.size = 1, outlier.stroke = 0.1, lwd = 0.3) +
+  scale_fill_manual(values = go_palette) +
+  atltheme() +
+  theme(axis.title.x = element_blank())
+# ggsave('R_plots/Exp024 residual l2FC by GO Term boxplot.pdf', device = cairo_pdf, units = 'in', width = 1.9, height = 1.9)
+
+kruskal.test(residual_l2FC_TPM ~ Category, data = TPM_residuals)
+print(FSA::dunnTest(TPM_residuals$residual_l2FC_TPM, TPM_residuals$Category, method = 'bh'))
+x <- x<-aov(residual_l2FC_TPM ~ Category, data = TPM_residuals)
+summary(x)
+TukeyHSD(x) 
+
+### plot on expression dependence graph
+ribosome <- filter(go_terms, Category == 'ribosome')$WormbaseID
+transcription <- filter(go_terms, Category == 'transcription')$WormbaseID
+nucleosome <- filter(go_terms, Category == 'nucleosome')$WormbaseID
+
+TPM_filt %>%
+  mutate(Category = case_when(WormbaseID %in% ribosome ~ 'ribosome',
+                              WormbaseID %in% transcription ~ 'transcription',
+                              # WormbaseID %in% nucleosome ~ 'nucleosome',
+                              TRUE ~ 'all_others'),
+         alpha = case_when(Category == 'all_others' ~ 0.05,
+                           TRUE ~0.4)) %>%
+  arrange(Category) %>%
+  ggplot(aes(con_TPM, l2FC_TPM, color = Category, alpha = alpha)) +
+  geom_point() +
+  scale_x_log10() +
+  scale_color_manual(values = c('black', 'darkorchid3', 'orange'))
+
+
+```
+
+## 8. l2FC of vitellogenin
+
+```{r vit rna}
+library(ggbeeswarm)
+library(extrafont)
+loadfonts('pdf', quiet = T)
+
+gg_jitter_with_summary3 = function(data, summary_data, x, y, color, mean, error_upper, error_lower){
+  ggplot() +
+    geom_hline(yintercept = 0, size = 0.4) +
+    stat_summary(data = data,
+                 aes(x = {{x}}, y = {{y}}),
+                 geom = 'bar',
+                 fun = 'mean',
+                 alpha = 0.6,
+                 width = 0.7,
+                 fill = 'gray70') +
+    geom_quasirandom(data = data, 
+                     aes(x = {{x}}, y = {{y}}, fill = {{color}}, size = {{x}}),
+                     shape = 21,
+                     stroke = 0.2,
+                     width = 0.4,
+                     alpha = 0.8) +
+    geom_errorbar(data = summary_data,
+                  aes(x = {{x}}, group = {{x}},
+                      ymin = {{error_upper}}, ymax = {{error_lower}}),
+                  width = 0.2) +
+    scale_fill_manual(values = c('gray50', '#fd8f00')) +
+    scale_size_discrete(range = c(1, 2)) +
+    theme(legend.position = 'none',
+          axis.title.x = element_blank(),
+          panel.background = element_blank(),
+          strip.background = element_blank(), 
+          legend.key = element_blank(),
+          axis.line = element_line(color = "black", linewidth = 0.3),
+          text = element_text(family = 'Arial', color = "black", size = 8),
+          axis.text = element_text(family = 'Arial', color = "black", size = 8))
+}
+
+vit_ids <- filter(TPM_filt, str_detect(GeneID, 'vit-')) %>% pull(WormbaseID)
+top_pct_ids <- TPM_filt %>%
+  mutate(ntile = ntile(con_TPM, 100)) %>%
+  filter(ntile >= 99) %>%
+  pull(WormbaseID)
+
+vit_vs_high <- TPM_filt %>%
+  mutate(group = case_when(WormbaseID %in% vit_ids ~ 'vit',
+                           WormbaseID %in% top_pct_ids ~ 'top3%',
+                           T ~ 'other'),
+         color = case_when(GeneID == 'vit-2' ~ 'vit-2',
+                           T ~ 'other')) %>% 
+  filter(group != 'other')
+vit_vs_high_summary <- vit_vs_high %>%
+  group_by(group) %>%
+  summarize(Mean = mean(l2FC_TPM), 
+            Lower = Mean - 1.96*sd(l2FC_TPM)/sqrt(n()),
+            Upper = Mean + 1.96*sd(l2FC_TPM)/sqrt(n()))
+
+gg_jitter_with_summary3(vit_vs_high, vit_vs_high_summary, 
+                        group, l2FC_TPM, color = color, Mean, Upper, Lower)  +
+  labs(y = expression(paste(log[2], 'FC TxPG')))
+  
+# ggsave('R_plots/Exp024 vit vs high.pdf', device = cairo_pdf, width = 1.2, height = 2.1, units = 'in')
+
+print(wilcox.test(l2FC_TPM~group, data = vit_vs_high))
+```
+
+```{r vit-2 rna-seq vs qpcr}
+qPCR_vit <- read.csv('analysis_tables/Exp024_qPCR_vit2_per_genome.csv', stringsAsFactors = F) %>%
+  mutate(WormbaseID = 'WBGene00006926')
+
+x <- TPM_mat_adj[vit_ids,] %>% data.frame() %>% 
+  rownames_to_column('WormbaseID') %>%
+  pivot_longer(cols = !WormbaseID, names_to = 'sample', values_to = 'TxPG') %>%
+  separate(sample, into = c('genotype', 'replicate'), sep = '(?=[A-C]$)', remove = F) %>% 
+  left_join(qPCR_vit) %>%
+  left_join(select(TPM_filt, WormbaseID, GeneID)) %>%
+  pivot_longer(cols = c(TxPG, RNA_PG_qPCR), names_to = 'metric', values_drop_na = T) %>%
+  mutate(group = paste(replicate, GeneID))
+
+x1 = x %>% filter(genotype == 'Control') %>%
+  group_by(WormbaseID, metric) %>%
+  summarize(mean_control = mean(value)) %>%
+  right_join(x) %>%
+  mutate(norm_value = value/mean_control)
+
+ggplot() +
+  geom_line(data = filter(x1, GeneID != 'vit-2'), aes(genotype, norm_value, group = group, color = GeneID)) +
+  geom_line(data = filter(x1, GeneID == 'vit-2'), aes(genotype, norm_value, group = group), color = '#dd1c77') +
+  facet_wrap(~metric, scales = 'free') +
+  scale_y_continuous(limits = c(0,2.4), breaks = seq(0,2.,0.5)) +
+  scale_color_manual(values = c('#c7e9b4', '#7fcdbb', '#41b6c4', '#2c7fb8', '#253494')) +
+  atltheme()
+ggsave('R_plots/Exp024 vit qPCR and TxPG paired.pdf', device = cairo_pdf, width = 2.1, height = 2.1, units = 'in')
+```
+
+Vits as a fraction of the transcriptome
+```{r}
+int_expressed <- pull(TPM_filt, WormbaseID)
+vit_TPMs <- TPM_mat[vit_ids,]
+nonvit_TPMs <- TPM_mat[!rownames(TPM_mat) %in% vit_ids, ]
+nonvit_TPMs <- nonvit_TPMs[rownames(nonvit_TPMs) %in% int_expressed, ]
+
+pct_vit_TPM <- colSums(vit_TPMs)/colSums(nonvit_TPMs)
+# exp( rowSums(log(mat)) / ncol(mat) 
+
+gm_mean <- function(x) { exp( mean( log(x))) }
+
+print(paste('control vit TPM fraction: ', gm_mean(pct_vit_TPM[1:3])))
+print(paste('lowploidy vit TPM fraction: ', gm_mean(pct_vit_TPM[4:6])))
+print(paste('lp fraction relative to control: ', gm_mean(pct_vit_TPM[4:6])/gm_mean(pct_vit_TPM[1:3])))
+```
+
+
+# Other analyses
+
+### Ppa expression vs FC
+```{r}
+con_Cel_TPMadj <- gm_mean_rowwise(TPM_mat_adj[,1:3])
+
+Ppa_TPM_bool <- row.names(TPM_mat) %in% Ppa_gene_list
+Ppa_TPM <- TPM_mat[Ppa_TPM_bool,]
+con_Ppa_TPM  <- gm_mean_rowwise(Ppa_TPM[,1:3])
+
+deseq_res <- count_res %>%
+  as.data.frame() %>%
+  rownames_to_column(var = 'WormbaseID') %>%
+  filter(baseMean > 0, !is.na(padj)) %>%
+  left_join(genes_df) %>%
+  left_join(enframe(con_Cel_TPMadj, name = 'WormbaseID', value = 'con_TPMadj')) %>%
+  left_join(enframe(con_Ppa_TPM, name = 'WormbaseID', value = 'con_TPM'))
+
+Cel = 'Caenorhabditis elegans'
+Ppa = 'Pristionchus pacificus'
+
+Cel_deseq_ntiles <- filter(deseq_res, Species == Cel, con_TPMadj > 0) %>%
+  mutate(ntile = ntile(con_TPMadj, 20)) %>%
+  group_by(ntile) %>%
+  summarize(mean_l2FC = mean(log2FoldChange),
+            mean_exp = mean(con_TPMadj))
+
+ggplot(filter(deseq_res, Species == Cel, con_TPMadj > 0), aes(con_TPMadj, log2FoldChange)) +
+  geom_point(alpha = 0.05) +
+  geom_point(data = Cel_deseq_ntiles, aes(mean_exp, mean_l2FC), color = 'blue') +
+  scale_x_log10() +
+  scale_y_continuous(limits = c(-1,3))
+
+Ppa_deseq_ntiles <- filter(deseq_res, Species == Ppa, con_TPM > 0) %>%
+  mutate(ntile = ntile(con_TPM, 20)) %>%
+  group_by(ntile) %>%
+  summarize(mean_l2FC = mean(log2FoldChange),
+            mean_exp = mean(con_TPM))
+
+ggplot(filter(deseq_res, Species == Ppa), aes(con_TPM, log2FoldChange)) +
+  geom_point(alpha = 0.05) +
+  geom_point(data = Ppa_deseq_ntiles, aes(mean_exp, mean_l2FC), color = 'blue') +
+  scale_x_log10() +
+  scale_y_continuous(limits = c(-5,7))
+```
+
+
+## GO term analysis with Perseus
+
+1.  Pull GO terms from CelPpaGeneList on wormmine
+
+Filter C. elegans genes: - Manage filters \> Define new filter -
+Organism \> Organism - = Caenorhabditis elegans
+
+Add columns for GO terms: - Ontology Annotations \> Qualifier - Ontology
+Annotations \> Ontology Term \> Identifier - Ontology Annotations \>
+Ontology Term \> Name - Drop species column
+
+Download table and save it to 'R analysis/CelGOTerms.tsv'
+
+## Export data for ChIP analysis
+
+```{r}
+TPM_df %>%
+  mutate(exp_bin_100 = ntile(con_TPM, 100),
+         exp_bin_for_ChIP = case_when(between(exp_bin_100, 51, 55) ~ '50-55',
+                                      between(exp_bin_100, 81, 85) ~ '80-85',
+                                      between(exp_bin_100, 91, 95) ~ '90-95',
+                                      between(exp_bin_100, 98, 99) ~ '97-99',
+                                      exp_bin_100 == 100 ~ '99-100',
+                                      TRUE ~ 'other',
+                                      )) %>%
+  write.table('R_output/RNA_TPM_for_ChIP.tsv', sep = '\t', row.names = FALSE)
+
+data.frame(con_TPM, lp_TPM) %>%
+  rownames_to_column('WormbaseID') %>%
+  filter(con_TPM < 1, lp_TPM < 1) %>%
+  left_join(genes_df) %>%
+  write.table('R_output/RNA_TPM_not_expressed_for_ChIP.tsv', sep = '\t', row.names = FALSE)
+```
+
+## Redo analysis with FPKM, reproduce original graph
+
+```{r}
+FPKM_mat_adj <- FPKM_mat[Cel_bool,] %*% diag(NF_df$TPM_per_DNA)
+# FPKM_mat_adj <- FPKM_mat[Cel_bool,] %*% diag(RNA_ratios_df$TPM_ratios)
+colnames(FPKM_mat_adj) <- colnames(FPKM_mat)
+
+con_FPKM <- gm_mean_rowwise(FPKM_mat_adj[,1:3])
+lp_FPKM <- gm_mean_rowwise(FPKM_mat_adj[,4:6])
+
+FPKM_df <- data.frame(con_FPKM, lp_FPKM) %>%
+  rownames_to_column('WormbaseID') %>%
+  #filter(con_FPKM > 0, lp_FPKM > 0) %>%
+  left_join(select(deseq_res, WormbaseID, baseMean)) %>%
+  mutate(l2FC_FPKM = log2(lp_FPKM/con_FPKM)) %>%
+  filter(!is.na(baseMean), 
+         is.finite(l2FC_FPKM),
+         # remove zif-1
+         WormbaseID != 'WBGene00006977') %>%
+  left_join(genes_df) %>%
+  select(-Species)
+
+FPKM_bins <- FPKM_df %>%
+  mutate(exp_bin = ntile(con_FPKM, 20)) %>%
+  group_by(exp_bin) %>%
+  summarize(mean_l2FC = mean(l2FC_FPKM),
+            mean_exp = mean(con_FPKM))
+
+ggplot(FPKM_df, aes(con_FPKM, l2FC_FPKM)) +
+  geom_point(alpha = 0.05) +
+  geom_point(data = FPKM_bins, aes(mean_exp, mean_l2FC), color = 'blue') +
+  scale_x_log10() +
+  scale_y_continuous(limits = c(-1, 3))
+```
+
+## Redo analysis with TPM and correct geometric mean, reproduce original graph
+
+```{r}
+gm_mean_rowwise = function(mat) exp( rowSums(log(mat)) / ncol(mat) )
+
+TPM_mat_adj <- TPM_mat[Cel_bool,] %*% diag(NF_df$TPM_per_DNA)
+# TPM_mat_adj <- TPM_mat[Cel_bool,] %*% diag(RNA_ratios_df$TPM_ratios)
+colnames(TPM_mat_adj) <- colnames(TPM_mat)
+
+con_TPM <- gm_mean_rowwise(TPM_mat_adj[,1:3])
+lp_TPM <- gm_mean_rowwise(TPM_mat_adj[,4:6])
+
+TPM_df <- data.frame(con_TPM, lp_TPM) %>%
+  rownames_to_column('WormbaseID') %>%
+  left_join(select(deseq_res, WormbaseID, baseMean)) %>%
+  mutate(l2FC_TPM = log2(lp_TPM/con_TPM)) %>%
+  filter(!is.na(baseMean), 
+         is.finite(l2FC_TPM),
+         # remove zif-1
+         WormbaseID != 'WBGene00006977') %>%
+  left_join(genes_df) %>%
+  select(-Species)
+
+TPM_bins <- TPM_df %>%
+  mutate(exp_bin = ntile(con_TPM, 20)) %>%
+  group_by(exp_bin) %>%
+  summarize(mean_l2FC = mean(l2FC_TPM),
+            mean_exp = mean(con_TPM))
+
+ggplot(TPM_df, aes(con_TPM, l2FC_TPM)) +
+  geom_point(alpha = 0.05) +
+  geom_point(data = TPM_bins, aes(mean_exp, mean_l2FC), color = 'blue') +
+  scale_x_log10() +
+  scale_y_continuous(limits = c(-3, 5))
+```

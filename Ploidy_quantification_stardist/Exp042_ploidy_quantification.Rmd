@@ -1,0 +1,189 @@
+---
+title: "Exp042 Ploidy Quantification"
+author: "Alex Lessenger"
+date: "2024-03-06"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# To do:
+2. Compare different int rings
+3. Check whether averaging C values per worm or per ring decreases noise
+
+```{r}
+library(tidyverse)
+library(ggbeeswarm)
+library(extrafont)
+loadfonts('pdf', quiet = T)
+
+atltheme = function() {
+  theme(legend.position = 'none',
+        panel.background = element_blank(),
+        strip.background = element_blank(), 
+        legend.key = element_blank(),
+        axis.line = element_line(color = "black", linewidth = 0.3),
+        text = element_text(family = 'Arial', color = "black", size = 8),
+        axis.text = element_text(family = 'Arial', color = "black", size = 8))
+}
+```
+
+```{r}
+raw_ploidy <- read.csv('quantification_data/Exp042_raw_ploidy.csv', stringsAsFactors = F)
+raw_ploidy_expanded <- read.csv('quantification_data/Exp042_raw_ploidy_expanded1.csv', stringsAsFactors = F)
+```
+
+## Ploidy measurements V1: normalize to tetraploid pachytene germline
+```{r}
+bgcor_ploidy <- raw_ploidy %>%
+  mutate(genotype = str_extract(image, '(?<=240129_)(\\w+)(?=_)'),
+         cell_type = case_when(tissue == 'germline' ~ 'germ',
+                               sub_tissue %in% c(1,8,9) ~ 'int1,8,9',
+                               sub_tissue == 2 ~ 'int2',
+                               TRUE ~ 'int3-7'),
+         bckg = 123, # from manually-measured cytoplasm of unstained worms
+         bgcor_mean_intensity = mean - bckg,
+         bgcor_total_intensity = bgcor_mean_intensity * number_of_pixels)
+
+ploidy <- bgcor_ploidy %>%
+  filter(tissue == 'germline', number_of_pixels_on_border == 0) %>%
+  group_by(image) %>%
+  summarize(haploid_intensity = mean(bgcor_total_intensity) / 4) %>%
+  right_join(bgcor_ploidy) %>%
+  mutate(c_val = bgcor_total_intensity / haploid_intensity) %>%
+  filter(tissue == 'intestine',
+         number_of_pixels_on_border < 0.1 * number_of_pixels)
+```
+
+```{r}
+p <- ploidy %>%
+  ggplot(aes(c_val, fill = genotype)) +
+  scale_x_log10(breaks = c(1,2,4,8,16,32,64)) +
+  geom_histogram(alpha = 0.25, bins = 30, position = 'identity')
+binwidth = layer_data(p) %>% mutate(w=xmax-xmin) %>% pull(w) %>% median
+p +
+  stat_bin(aes(color = genotype), geom = 'step',
+           binwidth = binwidth, position=position_nudge(x=-0.5*binwidth)) +
+  scale_fill_manual(values = c('firebrick2', 'gray50', 'dodgerblue2')) +
+  scale_color_manual(values = c('firebrick3','gray20', 'dodgerblue3')) +
+  annotation_logticks(sides = 'b') +
+  atltheme() 
+```
+
+## Ploidy measurements V2: normalize to expanded labels of tetraploid pachytene germline
+V1 Ploidy measurements gives fractional ploidies that are slightly higher than expected 2^n values, suggesting that the germline normalization value is slightly too low. This could be caused by under-segmented cells (which were never manually corrected). To fix this, I used `skimage.segmentation.expand_labels()` to expand the labels of all nuclei. Here, I normalize the non-expanded (but manually corrected) intestine values to the expanded germline values
+```{r}
+bgcor_ploidy_expanded <- raw_ploidy_expanded %>%
+  mutate(genotype = str_extract(image, '(?<=240129_)(\\w+)(?=_)'),
+         cell_type = case_when(tissue == 'germline' ~ 'germ',
+                               sub_tissue %in% c(1,8,9) ~ 'int1,8,9',
+                               sub_tissue == 2 ~ 'int2',
+                               TRUE ~ 'int3-7'),
+         bckg = 123, # from manually-measured cytoplasm of unstained worms
+         bgcor_mean_intensity = mean - bckg,
+         bgcor_total_intensity = bgcor_mean_intensity * number_of_pixels)
+
+ploidy2 <- bgcor_ploidy_expanded %>%
+  filter(tissue == 'germline', number_of_pixels_on_border <= 0.0*number_of_pixels) %>%
+  group_by(image) %>%
+  summarize(haploid_intensity = mean(bgcor_total_intensity) / 4) %>%
+  right_join(bgcor_ploidy) %>%
+  mutate(c_val = bgcor_total_intensity / haploid_intensity) %>%
+  filter(tissue == 'intestine',
+         number_of_pixels_on_border <= 0.05*number_of_pixels,
+         c_val > 1.8)
+
+p <- ploidy2 %>%
+  ggplot(aes(c_val, fill = genotype)) +
+  scale_x_log10(breaks = c(1,2,4,8,16,32,64)) +
+  geom_histogram(alpha = 0.5, bins = 30, position = 'identity')
+binwidth = layer_data(p) %>% mutate(w=xmax-xmin) %>% pull(w) %>% median
+p1 <- p +
+  stat_bin(aes(color = genotype), geom = 'step',
+           binwidth = binwidth, position=position_nudge(x=-0.5*binwidth)) +
+  # scale_fill_manual(values = c('firebrick2', 'black', 'dodgerblue2')) +
+  scale_fill_manual(values = c('#FF4F57','grey30', '#00328A')) +
+  scale_color_manual(values = c('#FF4F57','black', '#00328A')) +
+  annotation_logticks(sides = 'b') +
+  labs(x = 'nucleus ploidy (C)') +
+  atltheme() 
+# ggsave('R_plots/Exp042 ploidy histogram V2.pdf', p1, device = cairo_pdf, units = 'in', width = 3.2, height = 1.9)
+# ggsave('R_plots/Exp042 ploidy histogram V2.png', p1, device = 'png', units = 'in', width = 3.2, height = 1.9, dpi = 300)
+```
+
+```{r plot without F2s}
+p <- ploidy2 %>%
+  filter(genotype != 'balminF2') %>%
+  ggplot(aes(c_val, fill = genotype)) +
+  scale_x_log10(breaks = c(1,2,4,8,16,32,64)) +
+  geom_histogram(alpha = 0.5, bins = 30, position = 'identity')
+binwidth = layer_data(p) %>% mutate(w=xmax-xmin) %>% pull(w) %>% median
+p1 <- p +
+  stat_bin(aes(color = genotype), geom = 'step',
+           binwidth = binwidth, position=position_nudge(x=-0.5*binwidth)) +
+  # scale_fill_manual(values = c('firebrick2', 'black', 'dodgerblue2')) +
+  scale_fill_manual(values = c('#FF4F57', '#00328A')) +
+  scale_color_manual(values = c('#FF4F57', '#00328A')) +
+  annotation_logticks(sides = 'b') +
+  labs(x = 'nucleus ploidy (C)') +
+  atltheme() 
+# ggsave('R_plots/Exp042 ploidy histogram V2 no F2s.pdf', p1, device = cairo_pdf, units = 'in', width = 3.2, height = 1.9)
+# ggsave('R_plots/Exp042 ploidy histogram V2 no F2s.png', p1, device = 'png', units = 'in', width = 3.2, height = 1.9, dpi = 300)
+```
+
+### sumamry statistics and hypothesis testing
+```{r}
+# summary stats: mean and bootstrapped 95%CI
+ploidy2_summary <- ploidy2 %>%
+  group_by(genotype) %>%
+  do(data.frame(rbind(Hmisc::smean.cl.boot(.$c_val, B=10000)))) %>%
+  mutate(genotype = factor(genotype, levels = c('balminF2', 'balmin', 'balplus')))
+
+ggplot(ploidy2_summary, aes(genotype, color = genotype)) +
+  geom_point(aes(y = Mean), size = 1.5) +
+  geom_errorbar(aes(ymin = Lower, ymax = Upper), width = 0.9) +
+  coord_flip() +
+  scale_y_log10(breaks = c(1,2,4,8,16,32,64), limits = c(2, 40)) +
+  scale_color_manual(values = c('black', '#FF4F57', '#00328A')) +
+  atltheme() +
+  theme(rect = element_rect(fill = "transparent"),
+        panel.grid = element_blank())
+ggsave('R_plots/Exp042 ploidy summary stats V2.pdf', device = cairo_pdf, units = 'in', width = 3.2485, height = 1)
+
+p2 <- p1 + 
+  geom_vline(data = mutate(ploidy2_summary, genotype = factor(genotype, levels = c('balmin', 'balminF2', 'balplus'))),
+             aes(xintercept = Mean, color = genotype))
+# ggsave('R_plots/Exp042 ploidy histogram V2 with means.png', p2, device = 'png', units = 'in', width = 3.2, height = 1.9, dpi = 300)
+
+# hypothesis testing
+print(kruskal.test(c_val~genotype, data = ploidy2)$p.value)
+print(FSA::dunnTest(ploidy2$c_val, ploidy2$genotype, method = 'bh'))
+
+# by worm
+ploidy2_summary_byworm <- ploidy2 %>%
+  group_by(genotype, image) %>%
+  summarize(mean_cval = mean(c_val)) %>%
+  summarize(mean = mean(mean_cval), sd = sd(mean_cval), n = n())
+
+```
+
+### ploidy of CDK-2 gut(-) by cell type
+```{r}
+ploidy2 %>%
+  filter(genotype != 'balminF2') %>%
+  mutate(genotype = factor(genotype, levels = c('balplus', 'balmin'), labels = c('control', 'CDK-2gut(-)'))) %>%
+  ggplot(aes(c_val, fill = genotype)) +
+  scale_x_log10(breaks = c(1,2,4,8,16,32,64)) +
+  geom_histogram(bins = 20, position = 'identity') +
+  facet_grid(cell_type~genotype) +
+  scale_fill_manual(values = c('#00328A', '#FF4F57')) +
+  atltheme() +
+  labs(x = 'nucleus ploidy (C)') +
+  theme(panel.grid.major.x = element_line(color = 'grey60', linewidth = 0.1))
+ggsave('R_plots/Exp042 ploidy histogram by celltype.pdf', device = cairo_pdf, units = 'in', width = 3.9, height = 2.5)
+```
+
+## Combine with nucleus data for total ploidy graph
+
